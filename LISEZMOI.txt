@@ -1,0 +1,50 @@
+LANCEUR - un seul endroit pour lancer tes jeux Steam, Epic, Roblox, Minecraft
+=============================================================================
+
+C'est quoi ?
+  Une petite appli (6 Mo, rien à installer) qui affiche tous tes jeux avec leurs
+  pochettes, en un clic : Steam, Epic Games, Roblox, Minecraft, et ce que tu ajoutes
+  à la main. Elle ne remplace pas Steam ni Epic : elle les lit et leur demande de
+  lancer le jeu (ils s'ouvrent tout seuls si besoin).
+
+Pour l'utiliser
+  1. Dézippe le dossier où tu veux, puis double-clique sur Lanceur.exe.
+  2. Windows peut afficher « Windows a protégé votre ordinateur » : l'appli n'est pas
+     signée (un certificat coûte cher). Clique sur « Informations complémentaires »
+     puis « Exécuter quand même ». Ton antivirus peut aussi la signaler à tort : elle
+     lance curl et PowerShell pour télécharger les pochettes et ouvrir la boîte de fichier.
+  3. Il faut au moins Steam ou Epic Games installé sur le PC (lancé une fois).
+     Windows 10 ou 11 uniquement, carte graphique compatible OpenGL (presque toutes).
+
+Ce qu'elle lit et ce qu'elle envoie
+  - Elle lit les fichiers locaux de Steam et d'Epic (liste des jeux, temps de jeu,
+    pseudo, avatar). Rien n'est envoyé nulle part.
+  - Seul accès réseau : le téléchargement des pochettes (serveurs d'images de Steam
+    et d'Epic), gardées ensuite dans %LOCALAPPDATA%\Lanceur\covers.
+  - Tes réglages (favoris, jeux masqués, taille de fenêtre) sont dans
+    %APPDATA%\Lanceur\state.json.
+  - Pour tout enlever : supprime Lanceur.exe et ces deux dossiers « Lanceur ».
+
+Les onglets
+  Steam / Famille Steam / Epic / Autres / Tout / Profil.
+  - Famille Steam : Steam ne dit pas en local quels jeux non installés sont à toi ou
+    prêtés par la famille. Pour les séparer, range les tiens dans une collection
+    Steam (clic droit sur un jeu > Ajouter à > nouvelle collection), puis choisis-la
+    dans Profil > « Collection Steam qui contient mes jeux ». Sans collection, tout
+    est dans « Steam » (sauf les jeux installés qui appartiennent à un autre compte).
+  - Epic : la liste « à installer » vient du cache du lanceur Epic, elle peut contenir
+    des jeux que tu n'as pas. Epic ne garde pas le temps de jeu sur le PC.
+  - Autres : Roblox et Minecraft sont trouvés tout seuls. Profil > « Ajouter un jeu... »
+    pour un .exe ou un raccourci (GOG, EA, Ubisoft, Battle.net, etc.).
+
+Astuces
+  - Clic droit sur un jeu : dossier, page du magasin, pochette perso, masquer, désinstaller.
+  - Tape directement pour chercher. Flèches + Entrée pour lancer. Échap efface. F5 rescanne.
+  - Profil > « Quand je lance un jeu » : rester ouvert, se réduire ou se fermer.
+
+Ça ne marche pas ?
+  Ouvre l'onglet Profil, section Diagnostic : elle dit ce que l'appli a trouvé (Steam,
+  compte, Epic). Si ton Steam est dans un dossier inhabituel, lance l'appli avec la
+  variable d'environnement LANCEUR_STEAM=le\dossier\de\Steam.
+  Si « bibliothèque illisible » s'affiche : Steam a changé le format de son cache ;
+  seuls les jeux installés sont listés, il faut une mise à jour de Lanceur.
