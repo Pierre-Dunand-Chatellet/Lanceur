@@ -1,0 +1,134 @@
+name: Compiler et essayer
+
+# Compile Lanceur pour Linux et macOS (et lance les tests sur les trois systèmes), ouvre l'appli sur un écran virtuel
+# avec un faux dossier Steam, garde une capture d'écran et fabrique les paquets à télécharger.
+on:
+  push:
+    branches: [main, essai]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests
+        run: cargo test --release
+      - name: Compiler
+        run: cargo build --release
+      - name: Ouvrir l'appli sur un écran virtuel, avec un faux Steam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-venv xvfb imagemagick libgl1-mesa-dri libglx-mesa0 libegl1 libxkbcommon-x11-0 x11-utils xdotool openbox
+          export HOME="$RUNNER_TEMP/maison"
+          mkdir -p "$HOME/.local/share/Steam"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pillow
+          "$RUNNER_TEMP/venv/bin/python" ci/faux_steam.py "$HOME/.local/share/Steam"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a -s "-screen 0 1280x800x24" sh ci/capture_linux.sh linux
+          cat "$RUNNER_TEMP/lanceur.log" || true
+          ls -la "$HOME/.config/Lanceur" "$HOME/.cache/Lanceur" || true
+          cp "$RUNNER_TEMP/lanceur.log" .
+      - name: Paquet
+        run: |
+          mkdir paquet
+          cp target/release/lanceur paquet/Lanceur
+          cp ci/installer.sh ci/lanceur.desktop paquet/
+          cp assets/icon256.png paquet/lanceur.png
+          cp LISEZMOI-linux.txt paquet/LISEZMOI.txt
+          chmod +x paquet/Lanceur paquet/installer.sh
+          tar -C paquet -czf Lanceur-linux-x86_64.tar.gz Lanceur installer.sh lanceur.desktop lanceur.png LISEZMOI.txt
+          ls -la Lanceur-linux-x86_64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            Lanceur-linux-x86_64.tar.gz
+            linux-steam.png
+            linux-profil.png
+            linux-recherche.png
+            lanceur.log
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests
+        run: cargo test --release
+      - name: Compiler (Apple Silicon et Intel)
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p Lanceur.app/Contents/MacOS Lanceur.app/Contents/Resources
+          lipo -create -output Lanceur.app/Contents/MacOS/lanceur target/aarch64-apple-darwin/release/lanceur target/x86_64-apple-darwin/release/lanceur
+          lipo -info Lanceur.app/Contents/MacOS/lanceur
+      - name: Faire l'application (.app) avec son icône
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          mkdir icone.iconset
+          for s in 16 32 64 128 256; do sips -z $s $s assets/icon256.png --out icone.iconset/icon_${s}x${s}.png; done
+          cp icone.iconset/icon_32x32.png icone.iconset/icon_16x16@2x.png
+          cp icone.iconset/icon_64x64.png icone.iconset/icon_32x32@2x.png
+          cp icone.iconset/icon_256x256.png icone.iconset/icon_128x128@2x.png
+          iconutil -c icns icone.iconset -o Lanceur.app/Contents/Resources/Lanceur.icns
+          cat > Lanceur.app/Contents/Info.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Lanceur</string>
+            <key>CFBundleDisplayName</key><string>Lanceur</string>
+            <key>CFBundleIdentifier</key><string>fr.dunandchatellet.lanceur</string>
+            <key>CFBundleExecutable</key><string>lanceur</string>
+            <key>CFBundleIconFile</key><string>Lanceur</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # signature « ad hoc » : sans elle, un Mac Apple Silicon refuse de lancer le programme
+          codesign --force --deep -s - Lanceur.app
+          codesign -dv Lanceur.app 2>&1 | head -5
+      - name: Ouvrir l'appli avec un faux Steam
+        run: |
+          export HOME="$RUNNER_TEMP/maison"
+          mkdir -p "$HOME/Library/Application Support/Steam"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pillow
+          "$RUNNER_TEMP/venv/bin/python" ci/faux_steam.py "$HOME/Library/Application Support/Steam"
+          sh ci/capture_macos.sh macos-steam.png
+          mkdir -p "$HOME/Library/Application Support/Lanceur"
+          echo '{"scope":3}' > "$HOME/Library/Application Support/Lanceur/state.json"
+          sh ci/capture_macos.sh macos-profil.png
+          cat "$RUNNER_TEMP/lanceur.log" || true
+          ls -la "$HOME/Library/Application Support/Lanceur" "$HOME/Library/Caches/Lanceur" || true
+          cp "$RUNNER_TEMP/lanceur.log" . || true
+      - name: Paquet
+        run: |
+          cp LISEZMOI-macos.txt LISEZMOI.txt
+          ditto -c -k --keepParent Lanceur.app Lanceur-macos.zip
+          zip -q -j Lanceur-macos.zip LISEZMOI.txt
+          ls -la Lanceur-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            Lanceur-macos.zip
+            macos-steam.png
+            macos-profil.png
+            lanceur.log

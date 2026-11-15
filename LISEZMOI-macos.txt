@@ -1,0 +1,54 @@
+LANCEUR pour Mac - tous tes jeux Steam dans une seule fenêtre
+=============================================================
+
+C'est quoi ?
+  Une petite appli (quelques Mo) qui affiche tes jeux Steam avec leurs pochettes. Tu tapes
+  le début d'un nom, tu appuies sur Entrée, le jeu démarre. Elle ne remplace pas Steam :
+  elle lit ses fichiers et lui demande de lancer le jeu.
+
+Pour l'utiliser
+  1. Dézippe, puis glisse Lanceur dans le dossier Applications (ou laisse-le où tu veux).
+  2. La première fois, macOS refuse d'ouvrir l'appli parce qu'elle n'est pas signée par
+     Apple (un compte développeur coûte 99 $ par an). Deux façons de l'autoriser :
+       - clic droit sur Lanceur > Ouvrir > Ouvrir ;
+       - ou, dans le Terminal : xattr -dr com.apple.quarantine /Applications/Lanceur.app
+     Il suffit de le faire une fois.
+  3. macOS 11 ou plus récent, Mac Apple Silicon ou Intel.
+
+Il faut
+  - Steam, lancé au moins une fois. Lanceur le cherche dans
+    ~/Library/Application Support/Steam. S'il est ailleurs, lance Lanceur depuis le
+    Terminal avec LANCEUR_STEAM=/ton/dossier/steam.
+
+Ce qu'il lit et ce qu'il envoie
+  - Il lit les fichiers locaux de Steam (liste des jeux, temps de jeu, pseudo, avatar).
+    Rien n'est envoyé nulle part.
+  - Seul accès réseau : le téléchargement des pochettes (serveurs d'images de Steam),
+    gardées ensuite dans ~/Library/Caches/Lanceur/covers.
+  - Tes réglages (favoris, jeux masqués, taille de fenêtre) sont dans
+    ~/Library/Application Support/Lanceur/state.json.
+  - Pour tout enlever : supprime Lanceur.app et ces deux dossiers « Lanceur ».
+
+Ce qui marche, et ce qui est incertain sur Mac
+  - Onglets Steam / Famille Steam / Tout / Profil, installés et à installer, temps de jeu,
+    tri, recherche au clavier, clic droit, favoris, jeux masqués : comme sous Windows.
+  - Epic Games : Lanceur cherche les données du lanceur Epic dans les dossiers où elles
+    se trouvent d'après ce que j'ai pu lire, mais je n'ai pas pu le vérifier sur un Mac.
+    Si l'onglet Epic n'apparaît pas alors que tu as des jeux Epic, dis-le moi.
+  - Roblox et Minecraft sont trouvés tout seuls s'ils sont dans Applications.
+  - « Ajouter un jeu » (Profil) : une application (.app) ou un programme.
+  - Famille Steam : Steam ne dit pas en local quels jeux sont à toi ou prêtés. Range les
+    tiens dans une collection Steam, puis choisis-la dans Profil > « Collection Steam qui
+    contient mes jeux ».
+
+Astuces
+  - Tape directement pour chercher. Flèches + Entrée pour lancer. Échap efface. F5 rescanne.
+  - Clic droit sur un jeu : dossier, page du magasin, pochette perso, masquer, désinstaller.
+
+Ça ne marche pas ?
+  Ouvre l'onglet Profil, section Diagnostic : elle dit ce que l'appli a trouvé (Steam,
+  compte). Dis-le sur https://github.com/Pierre-Dunand-Chatellet/Lanceur/issues
+
+Limites
+  Cette version Mac a été compilée sur un Mac virtuel de GitHub. Je ne l'ai pas essayée
+  sur un vrai Mac, ni avec un vrai Steam.

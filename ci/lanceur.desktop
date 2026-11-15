@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lanceur
+Comment=Tous tes jeux Steam dans une seule fenêtre
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Game;
+StartupWMClass=Lanceur

@@ -1,10 +1,10 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(windows, windows_subsystem = "windows")]
+mod plat;
 use eframe::egui::{self, Align, Color32, ColorImage, FontId, Layout, RichText, Sense, TextureHandle, Vec2};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -24,8 +24,6 @@ const SURFACE: Color32 = Color32::from_rgb(0x19, 0x1b, 0x1f);
 const DOUX: Color32 = Color32::from_rgb(0xb4, 0xb7, 0xbe);
 const TEX_W: u32 = 200;
 const TEX_H: u32 = 300;
-const NO_WINDOW: u32 = 0x0800_0000;
-const MINECRAFT: &str = "Microsoft.4297127D64EC6_8wekyb3d8bbwe";
 
 #[derive(Clone, Copy, PartialEq, Default)]
 enum Store {
@@ -67,39 +65,13 @@ fn fmt_time(min: u32) -> String {
         _ => format!("{} h", (min + 30) / 60),
     }
 }
-/// Décalage de l'heure locale par rapport à UTC, en secondes (demandé à Windows).
-fn local_offset() -> i64 {
-    #[repr(C)]
-    struct Tzi {
-        bias: i32,
-        _std_name: [u16; 32],
-        _std_date: [u16; 8],
-        std_bias: i32,
-        _dl_name: [u16; 32],
-        _dl_date: [u16; 8],
-        dl_bias: i32,
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetTimeZoneInformation(tzi: *mut Tzi) -> u32;
-    }
-    let mut t = std::mem::MaybeUninit::<Tzi>::zeroed();
-    // SAFETY : la structure a la disposition de TIME_ZONE_INFORMATION (172 octets) ; Windows la remplit, et tout-à-zéro est valide.
-    let (r, t) = unsafe { (GetTimeZoneInformation(t.as_mut_ptr()), t.assume_init()) };
-    let saison = match r {
-        1 => t.std_bias,
-        2 => t.dl_bias,
-        _ => 0,
-    };
-    -60 * (t.bias + saison) as i64
-}
 /// Nombre de minuits (heure locale) passés entre `t` et `now` : un jeu lancé hier à 23 h est « hier », pas « aujourd'hui ».
 fn days_between(now: u64, t: u64, offset: i64) -> u64 {
     let day = |x: u64| (x as i64 + offset).div_euclid(86_400);
     (day(now) - day(t)).max(0) as u64
 }
 fn fmt_ago(t: u64) -> String {
-    match days_between(now(), t, local_offset()) {
+    match days_between(now(), t, plat::local_offset()) {
         0 => "aujourd'hui".into(),
         1 => "hier".into(),
         d @ 2..=59 => format!("il y a {d} jours"),
@@ -169,11 +141,8 @@ impl Default for State {
         State { favs: HashSet::new(), last: HashMap::new(), accent: 0, card_w: 170.0, scope: 0, sort: 0, hidden: HashSet::new(), on_launch: 0, win: None, maximized: false, custom: vec![], collection: String::new() }
     }
 }
-fn app_dir(var: &str) -> PathBuf {
-    PathBuf::from(std::env::var(var).unwrap_or_default()).join("Lanceur")
-}
 fn state_path() -> PathBuf {
-    app_dir("APPDATA").join("state.json")
+    plat::config_dir().join("state.json")
 }
 fn load_state() -> State {
     fs::read_to_string(state_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
@@ -349,23 +318,16 @@ fn quoted(line: &str) -> Vec<String> {
     out
 }
 
-/// Chemin Windows écrit avec des antislashs (le registre donne `c:/program files/steam` : l'Explorateur n'en veut pas).
+/// Chemin écrit comme le système le veut (sur Windows : antislashs, voir plat::native_path).
 fn backslashes(p: &Path) -> PathBuf {
-    PathBuf::from(p.to_string_lossy().replace('/', "\\"))
+    plat::native_path(p)
 }
 
 fn steam_root() -> Option<PathBuf> {
-    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
     if let Some(p) = std::env::var_os("LANCEUR_STEAM") {
         return Some(PathBuf::from(p)).filter(|p| p.exists()); // dossier Steam imposé (installation hors norme, essais)
     }
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey("Software\\Valve\\Steam")
-        .ok()
-        .and_then(|k| k.get_value::<String, _>("SteamPath").ok())
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(r"C:\Program Files (x86)\Steam")))
-        .filter(|p| p.exists())
+    plat::steam_default()
 }
 
 fn cache_file(root: &Path, id: &str, name: &str) -> Option<PathBuf> {
@@ -504,7 +466,7 @@ fn parse_playtime(t: &str, out: &mut HashMap<String, (u32, u64)>) {
 }
 
 fn owned_cache() -> PathBuf {
-    app_dir("LOCALAPPDATA").join("owned.json")
+    plat::cache_dir().join("owned.json")
 }
 fn load_owned() -> Option<HashSet<u32>> {
     serde_json::from_str(&fs::read_to_string(owned_cache()).ok()?).ok()
@@ -547,7 +509,7 @@ fn collection_owned(setting: &str) -> Option<HashSet<u32>> {
 /// Mes jeux (hors famille) : liste publique de mon profil. Vide/None si le profil est privé.
 fn fetch_owned(sid: &str) -> Option<HashSet<u32>> {
     let url = format!("https://steamcommunity.com/profiles/{sid}/games?tab=all&xml=1");
-    let out = Command::new("curl.exe").args(["-s", "-L", "-m", "20", &url]).creation_flags(NO_WINDOW).output().ok()?;
+    let out = plat::quiet(Command::new(plat::curl()).args(["-s", "-L", "-m", "20", &url])).output().ok()?;
     let t = String::from_utf8_lossy(&out.stdout);
     if !t.contains("<gamesList>") {
         return None;
@@ -571,7 +533,7 @@ fn spawn_owned(ctx: egui::Context, coll: &str) -> mpsc::Receiver<HashSet<u32>> {
     std::thread::spawn(move || {
         let Some(sid) = steam_root().and_then(|r| steam_id(&r)) else { return };
         if let Some(set) = fetch_owned(&sid) {
-            let _ = fs::create_dir_all(app_dir("LOCALAPPDATA"));
+            let _ = fs::create_dir_all(plat::cache_dir());
             let _ = fs::write(owned_cache(), serde_json::to_string(&set).unwrap_or_default());
             let _ = tx.send(set);
             ctx.request_repaint();
@@ -605,7 +567,7 @@ fn scan_steam(coll: &str) -> Vec<Game> {
     // le dossier de Steam est aussi dans cette liste (écrit autrement) : sans ce tri il était lu deux fois
     libs.push(backslashes(&root));
     let mut seen = HashSet::new();
-    libs.retain(|l| seen.insert(l.to_string_lossy().trim_end_matches('\\').to_lowercase()));
+    libs.retain(|l| seen.insert(plat::path_key(l)));
     let mut out: HashMap<String, Game> = HashMap::new();
     // 1) jeux installés (manifests)
     for lib in libs {
@@ -695,9 +657,10 @@ struct CatItem {
     image: Option<String>,
 }
 
-/// Données du lanceur Epic (%ProgramData%, pas forcément sur C:).
+/// Données du lanceur Epic : le premier emplacement habituel qui existe (Windows : ProgramData, pas forcément sur C:).
 fn epic_data() -> PathBuf {
-    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join(r"Epic\EpicGamesLauncher\Data")
+    let c = plat::epic_candidates();
+    c.iter().find(|p| p.join("Manifests").is_dir() || p.join("Catalog").is_dir()).or(c.first()).cloned().unwrap_or_default()
 }
 
 /// Cache du catalogue Epic (base64 -> JSON) : titres, identifiants et pochettes des jeux connus du compte.
@@ -818,15 +781,17 @@ fn setup_lines() -> Vec<(bool, String)> {
         }
         None => v.push((false, "Steam introuvable".to_string())),
     }
-    let epic = epic_data().join("Manifests").exists();
-    v.push((epic, if epic { "Epic Games Launcher trouvé" } else { "Epic Games Launcher introuvable" }.to_string()));
+    if !cfg!(all(unix, not(target_os = "macos"))) {
+        // sous Linux Epic n'a pas de lanceur : inutile de dire qu'il est « introuvable »
+        let epic = epic_data().join("Manifests").exists();
+        v.push((epic, if epic { "Epic Games Launcher trouvé" } else { "Epic Games Launcher introuvable" }.to_string()));
+    }
     v
 }
 
 /// Hors boutiques : Roblox et Minecraft s'ils sont là, plus les jeux ajoutés à la main (Profil > Ajouter un jeu).
 /// Ubisoft Connect : rien à détecter ici (ses jeux installés passent par Steam).
 fn scan_other(custom: &[(String, String)]) -> Vec<Game> {
-    let local = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default());
     let other = |id: String, name: &str, target: String, dir: Option<PathBuf>| Game {
         id,
         name: name.to_string(),
@@ -839,14 +804,10 @@ fn scan_other(custom: &[(String, String)]) -> Vec<Game> {
         ..Default::default()
     };
     let mut out = vec![];
-    // Roblox : un dossier par version, on prend la plus récente
-    let roblox = fs::read_dir(local.join("Roblox/Versions")).into_iter().flatten().flatten().map(|e| e.path().join("RobloxPlayerBeta.exe")).filter(|p| p.exists());
-    // antislashs partout : avec un « / » dans le chemin, l'Explorateur ouvrait Documents au lieu de lancer Roblox
-    if let Some(exe) = roblox.max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok()).map(|p| backslashes(&p)) {
-        out.push(other("other:roblox".into(), "Roblox", exe.to_string_lossy().into_owned(), exe.parent().map(Path::to_path_buf)));
-    }
-    if local.join("Packages").join(MINECRAFT).exists() {
-        out.push(other("other:minecraft".into(), "Minecraft", format!("shell:AppsFolder\\{MINECRAFT}!Minecraft"), None));
+    // Roblox et Minecraft quand ils sont installés de la façon habituelle (Windows et Mac, voir plat::autres_jeux)
+    for (id, name, target) in plat::autres_jeux() {
+        let dir = Path::new(&target).parent().filter(|_| !target.starts_with("shell:")).map(Path::to_path_buf);
+        out.push(other(id.into(), name, target, dir));
     }
     for (name, path) in custom {
         out.push(other(format!("other:{path}"), name, path.clone(), Path::new(path).parent().map(Path::to_path_buf)));
@@ -863,40 +824,35 @@ fn scan_all(owned: &Option<HashSet<u32>>, custom: &[(String, String)], coll: &st
 }
 
 fn open_url(url: &str) {
-    let _ = Command::new("explorer.exe").arg(url).creation_flags(NO_WINDOW).spawn();
+    plat::open(url);
 }
 
-/// Boîte « Ouvrir » de Windows, dans un thread (le chemin choisi arrive par le canal).
-// ponytail: passe par PowerShell (≈1 s d'attente) pour ne pas ajouter de dépendance ; crate `rfd` si ça gêne.
-fn pick_file(filter: &'static str, what: Pick, tx: mpsc::Sender<(Pick, String)>, ctx: egui::Context) {
+/// Boîte « Ouvrir » du système, dans un thread (le chemin choisi arrive par le canal ; voir plat::choose_file).
+fn pick_file(what: Pick, tx: mpsc::Sender<(Pick, String)>, ctx: egui::Context) {
     std::thread::spawn(move || {
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; [Console]::OutputEncoding=[Text.Encoding]::UTF8; \
-             $f=New-Object Windows.Forms.Form -Property @{{TopMost=$true}}; $d=New-Object Windows.Forms.OpenFileDialog; \
-             $d.Filter='{filter}'; $d.DereferenceLinks=$false; if($d.ShowDialog($f) -eq 'OK'){{$d.FileName}}"
-        );
-        let Ok(out) = Command::new("powershell.exe").args(["-NoProfile", "-STA", "-Command", &script]).creation_flags(NO_WINDOW).output() else { return };
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !path.is_empty() {
-            let _ = tx.send((what, path));
-            ctx.request_repaint();
+        match plat::choose_file(matches!(what, Pick::Cover(_))) {
+            Ok(Some(path)) => drop(tx.send((what, path))),
+            Ok(None) => return, // fenêtre fermée sans choisir
+            Err(message) => drop(tx.send((Pick::Message, message))),
         }
+        ctx.request_repaint();
     });
 }
 enum Pick {
     Cover(String), // pochette personnalisée pour ce jeu
     AddGame,
+    Message, // la boîte n'a pas pu s'ouvrir : le texte dit pourquoi
 }
 /// Pochette choisie par l'utilisateur : elle passe avant toutes les autres.
 fn custom_cover(id: &str) -> PathBuf {
     let safe: String = id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-    app_dir("LOCALAPPDATA").join("covers").join(format!("custom_{safe}"))
+    plat::cache_dir().join("covers").join(format!("custom_{safe}"))
 }
 
 // ---------- pochettes : récupération + mise à la bonne taille (200x300) ----------
 
 fn fetch(url: &str, to: &Path) -> bool {
-    let ok = Command::new("curl.exe").args(["-s", "-f", "-L", "-m", "15", "-o"]).arg(to).arg(url).creation_flags(NO_WINDOW).status().is_ok_and(|s| s.success());
+    let ok = plat::quiet(Command::new(plat::curl()).args(["-s", "-f", "-L", "-m", "15", "-o"]).arg(to).arg(url)).status().is_ok_and(|s| s.success());
     if !ok || fs::metadata(to).map(|m| m.len()).unwrap_or(0) < 1000 {
         let _ = fs::remove_file(to);
         return false;
@@ -944,7 +900,7 @@ type Job = (String, Vec<Src>);
 /// Pochettes à la demande : une carte qui devient visible dépose sa demande, 4 threads se partagent la file
 /// (le téléchargement est le point lent). Rien n'est chargé pour les jeux qu'on ne regarde jamais.
 fn spawn_loader(ctx: egui::Context) -> (mpsc::Sender<Job>, mpsc::Receiver<(String, Option<ColorImage>)>) {
-    let cache = app_dir("LOCALAPPDATA").join("covers");
+    let cache = plat::cache_dir().join("covers");
     let _ = fs::create_dir_all(&cache);
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let job_rx = Arc::new(Mutex::new(job_rx));
@@ -1073,6 +1029,8 @@ impl App {
         st.on_launch = st.on_launch.min(2);
         st.accent = st.accent.min(ACCENTS.len() - 1);
         st.card_w = if st.card_w.is_finite() { st.card_w.clamp(120.0, 260.0) } else { 170.0 };
+        // toujours le thème sombre : sans ça, un Mac ou un Windows en mode clair affichait des textes noirs sur fond noir
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         apply_theme(&cc.egui_ctx, ACCENTS[st.accent]);
         let owned = owned_for(&st.collection);
         let games = scan_all(&owned, &st.custom, &st.collection);
@@ -1179,7 +1137,7 @@ impl App {
             }
             Act::Folder => {
                 match g.dir.as_deref().map(backslashes).filter(|d| d.is_dir()) {
-                    Some(d) => drop(Command::new("explorer.exe").arg(d).spawn()),
+                    Some(d) => plat::open(&d.to_string_lossy()),
                     None => self.toast(ctx, format!("Dossier de {} introuvable", g.name)),
                 }
             }
@@ -1191,7 +1149,7 @@ impl App {
                 }
             },
             Act::Uninstall => open_url(&format!("steam://uninstall/{steam_id}")), // Steam demande lui-même confirmation
-            Act::Cover => pick_file("Images|*.jpg;*.jpeg;*.png", Pick::Cover(g.id), self.pick_tx.clone(), ctx.clone()),
+            Act::Cover => pick_file(Pick::Cover(g.id), self.pick_tx.clone(), ctx.clone()),
             Act::CoverReset => {
                 let _ = fs::remove_file(custom_cover(&g.id));
                 self.tex.remove(&g.id);
@@ -1498,10 +1456,10 @@ impl App {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.button("Ajouter un jeu…").on_hover_text("Un .exe ou un raccourci : pour les jeux hors Steam et Epic").clicked() {
-                    pick_file("Jeux et raccourcis|*.exe;*.lnk;*.url", Pick::AddGame, self.pick_tx.clone(), ui.ctx().clone());
+                if ui.button("Ajouter un jeu…").on_hover_text(format!("{} : pour les jeux hors Steam et Epic", plat::PROGRAMME)).clicked() {
+                    pick_file(Pick::AddGame, self.pick_tx.clone(), ui.ctx().clone());
                 }
-                ui.label(RichText::new("Roblox et Minecraft sont trouvés tout seuls.").color(gray));
+                ui.label(RichText::new(plat::TROUVES_SEULS).color(gray));
             });
             let mut remove = None;
             for (i, (name, path)) in self.st.custom.iter().enumerate() {
@@ -1552,7 +1510,7 @@ impl App {
             ui.label(RichText::new("Epic : la liste « à installer » vient du cache du lanceur Epic, pas de ta vraie bibliothèque : elle peut contenir des jeux que tu n'as pas.").color(gray));
             ui.add_space(10.0);
             ui.label(RichText::new("Clavier : flèches pour choisir, Entrée pour lancer, tape du texte pour chercher, Échap pour effacer, F5 pour rescanner.").color(gray));
-            ui.label(RichText::new(format!("Lanceur v{}", env!("CARGO_PKG_VERSION"))).color(gray));
+            ui.label(RichText::new(format!("Lanceur v{} ({})", env!("CARGO_PKG_VERSION"), plat::OS)).color(gray));
         });
     }
 }
@@ -1609,6 +1567,7 @@ impl eframe::App for App {
                         self.toast(ctx, "Impossible de copier cette image".to_string());
                     }
                 }
+                Pick::Message => self.toast(ctx, path),
                 Pick::AddGame => {
                     if !self.st.custom.iter().any(|c| c.1 == path) {
                         let name = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1981,7 +1940,11 @@ mod tests {
         assert_eq!(quoted("\t\"PersonaName\"\t\t\"Le \\\"Boss\\\"\""), vec!["PersonaName", "Le \"Boss\""]);
         assert_eq!(quoted("\t\"730\""), vec!["730"]);
         assert_eq!(quoted("{"), Vec::<String>::new());
+        #[cfg(windows)]
         assert_eq!(backslashes(Path::new("c:/program files (x86)/steam")), PathBuf::from("c:\\program files (x86)\\steam"));
+        #[cfg(not(windows))]
+        assert_eq!(backslashes(Path::new("/home/moi/.steam")), PathBuf::from("/home/moi/.steam"));
+        assert_eq!(plat::path_key(Path::new("/a/b/")), plat::path_key(Path::new("/a/b")), "un même dossier écrit avec ou sans « / » final");
     }
 
     #[test]
@@ -2000,7 +1963,7 @@ mod tests {
         assert_eq!(days_between(minuit + 9 * 3600, minuit + 3600, 0), 0);
         assert_eq!(days_between(minuit + 1800, minuit - 1800, 3600), 0, "à UTC+1, 23 h 30 et 0 h 30 UTC sont le même jour");
         assert_eq!(days_between(minuit, minuit + 5, 0), 0, "horloge en retard : jamais négatif");
-        assert!((-14 * 3600..=14 * 3600).contains(&local_offset()));
+        assert!((-14 * 3600..=14 * 3600).contains(&plat::local_offset()));
     }
 
     #[test]
@@ -2030,6 +1993,10 @@ fn main() -> eframe::Result {
         let rgba = img.to_rgba8();
         viewport = viewport.with_icon(egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() });
     }
+    // Mac : Metal (via wgpu) plutôt qu'OpenGL, que macOS ne garde que par tolérance
+    #[cfg(target_os = "macos")]
+    let opts = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, ..Default::default() };
+    #[cfg(not(target_os = "macos"))]
     let opts = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Lanceur", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }

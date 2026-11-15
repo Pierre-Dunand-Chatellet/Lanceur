@@ -1,6 +1,6 @@
 # Lanceur
 
-Une seule fenêtre, légère, pour lancer ses jeux **Steam, Epic Games, Roblox et Minecraft** (et ce qu'on ajoute à la main) sous Windows.
+Une seule fenêtre, légère, pour lancer ses jeux **Steam** (et, sous Windows, **Epic Games, Roblox et Minecraft**), plus ce qu'on ajoute à la main. Pour **Windows, Linux et macOS**.
 
 Lanceur ne remplace pas Steam ni Epic : il lit leurs fichiers locaux pour dresser la liste, puis leur demande de lancer le jeu, comme le ferait un raccourci.
 
@@ -8,11 +8,19 @@ Lanceur ne remplace pas Steam ni Epic : il lit leurs fichiers locaux pour dresse
 
 ## Télécharger
 
-**[Lanceur-windows.zip](https://github.com/Pierre-Dunand-Chatellet/Lanceur/releases/latest/download/Lanceur-windows.zip)** (3 Mo, Windows 10 / 11) : dézipper, lancer `Lanceur.exe`, rien à installer. Il faut Steam ou Epic Games sur le PC, lancé au moins une fois.
+| Système | Fichier | Taille |
+|---|---|---|
+| Windows 10 / 11 | [Lanceur-windows.zip](https://github.com/Pierre-Dunand-Chatellet/Lanceur/releases/latest/download/Lanceur-windows.zip) | 3 Mo |
+| Linux (x86_64) | [Lanceur-linux-x86_64.tar.gz](https://github.com/Pierre-Dunand-Chatellet/Lanceur/releases/latest/download/Lanceur-linux-x86_64.tar.gz) | 4 Mo |
+| macOS 11 ou plus (Apple Silicon et Intel) | [Lanceur-macos.zip](https://github.com/Pierre-Dunand-Chatellet/Lanceur/releases/latest/download/Lanceur-macos.zip) | 8 Mo |
 
-L'exécutable n'est pas signé : Windows peut afficher « Windows a protégé votre ordinateur ». Cliquer sur « Informations complémentaires » puis « Exécuter quand même ». Le fichier [`LISEZMOI.txt`](LISEZMOI.txt) explique le reste.
+Rien à installer : on extrait et on lance. Il faut Steam sur l'ordinateur, lancé au moins une fois.
 
-Page de présentation : <https://dunandchatellet.fr/lanceur/>
+- **Windows** : l'exécutable n'est pas signé, Windows peut afficher « Windows a protégé votre ordinateur » : « Informations complémentaires », puis « Exécuter quand même ».
+- **Linux** : `./Lanceur`, ou `./installer.sh` pour l'ajouter au menu des applications (pour ton compte seulement). `zenity` ou `kdialog` pour « Changer la pochette » et « Ajouter un jeu ».
+- **macOS** : l'application n'est pas signée par Apple : clic droit sur Lanceur, « Ouvrir », puis « Ouvrir » (une seule fois).
+
+Les LISEZMOI du zip et de l'archive expliquent le reste. Page de présentation : <https://dunandchatellet.fr/lanceur/>
 
 ## Ce qu'il fait
 
@@ -24,6 +32,7 @@ Page de présentation : <https://dunandchatellet.fr/lanceur/>
 - Clavier : taper pour chercher, flèches et Entrée pour lancer, Échap pour effacer, F5 pour rescanner.
 - Profil : heures totales, jeux les plus joués, derniers lancés, réglages et diagnostic.
 - Se réduit ou se ferme au lancement d'un jeu, au choix ; retient la taille de la fenêtre.
+- Même programme, même code sur les trois systèmes : seul `src/plat.rs` change d'un système à l'autre.
 
 ![Le menu du clic droit](docs/menu.jpg)
 
@@ -41,6 +50,9 @@ Page de présentation : <https://dunandchatellet.fr/lanceur/>
 
 ## Compiler
 
+Le fichier `.github/workflows/compiler.yml` compile pour les trois systèmes, lance les tests, ouvre l'application sur un écran virtuel avec un faux Steam et fabrique les archives.
+
+
 Il faut la chaîne Rust (cible `x86_64-pc-windows-gnu` ou `-msvc`) :
 
 ```
@@ -51,8 +63,9 @@ cargo test --release -- --ignored --nocapture   # essai sur le vrai PC : dépend
 
 ## Limites
 
-- Windows uniquement.
-- Essayé jusqu'ici sur un seul PC. Si Steam change le format de son cache, un bandeau le dit et seuls les jeux installés sont listés.
+- Epic Games, Roblox et Minecraft : trouvés tout seuls sous Windows seulement (Roblox et Minecraft aussi sous macOS s'ils sont dans Applications, non vérifié). Epic n'a pas de lanceur pour Linux.
+- Les versions Linux et macOS ont été compilées et ouvertes sur des machines virtuelles de GitHub (faux dossier Steam, `ci/faux_steam.py`), jamais avec un vrai Steam sous Linux ni sur un vrai Mac.
+- Windows : essayé jusqu'ici sur un seul PC. Si Steam change le format de son cache, un bandeau le dit et seuls les jeux installés sont listés.
 - GOG, EA, Ubisoft Connect et Battle.net ne sont pas détectés : « Ajouter un jeu… » dans le Profil.
 
 ## À propos
