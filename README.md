@@ -4,11 +4,11 @@ Une seule fenêtre, légère, pour lancer ses jeux **Steam, Epic Games, Roblox e
 
 Lanceur ne remplace pas Steam ni Epic : il lit leurs fichiers locaux pour dresser la liste, puis leur demande de lancer le jeu, comme le ferait un raccourci.
 
-![Les jeux Steam installés, triés par temps de jeu](docs/jeux.jpg)
+![Le dernier jeu lancé en grand, puis les jeux Steam installés, triés par temps de jeu](docs/jeux.jpg)
 
 ## Télécharger
 
-**[Lanceur-windows.zip](https://github.com/Pierre-Dunand-Chatellet/Lanceur/releases/latest/download/Lanceur-windows.zip)** (2,8 Mo, Windows 10 / 11) : dézipper, lancer `Lanceur.exe`, rien à installer. Il faut Steam ou Epic Games sur le PC, lancé au moins une fois.
+**[Lanceur-windows.zip](https://github.com/Pierre-Dunand-Chatellet/Lanceur/releases/latest/download/Lanceur-windows.zip)** (3 Mo, Windows 10 / 11) : dézipper, lancer `Lanceur.exe`, rien à installer. Il faut Steam ou Epic Games sur le PC, lancé au moins une fois.
 
 L'exécutable n'est pas signé : Windows peut afficher « Windows a protégé votre ordinateur ». Cliquer sur « Informations complémentaires » puis « Exécuter quand même ». Le fichier [`LISEZMOI.txt`](LISEZMOI.txt) explique le reste.
 
@@ -16,6 +16,7 @@ Page de présentation : <https://dunandchatellet.fr/lanceur/>
 
 ## Ce qu'il fait
 
+- Le dernier jeu lancé en grand, avec son temps de jeu et un bouton Jouer.
 - Onglets par provenance : Steam, Famille Steam, Epic, Autres, Tout.
 - Jeux installés et à installer dans deux blocs ; un clic sur un jeu non installé lance son installation.
 - Temps de jeu et dernier lancement lus dans les données de Steam ; tri par nom, par récents ou par temps de jeu.
@@ -30,7 +31,7 @@ Page de présentation : <https://dunandchatellet.fr/lanceur/>
 
 ## Comment ça marche
 
-- **Rust** avec [eframe / egui](https://github.com/emilk/egui) (OpenGL). Un seul fichier source, `src/main.rs`. L'exécutable pèse 6 Mo et ne dépend que de Windows.
+- **Rust** avec [eframe / egui](https://github.com/emilk/egui) (OpenGL). Un seul fichier source, `src/main.rs`. Police : Schibsted Grotesk (licence SIL OFL, dans `assets/fonts`). L'exécutable pèse 6 Mo et ne dépend que de Windows.
 - **Steam** : la liste complète vient du cache local (`appcache/appinfo.vdf` et `packageinfo.vdf`), les jeux installés des manifestes `appmanifest_*.acf`, le temps de jeu de `userdata/<compte>/config/localconfig.vdf`. Le compte est celui marqué `MostRecent` dans `config/loginusers.vdf`. Aucun compte à saisir, aucune clé d'API.
 - **Famille Steam** : Steam ne dit pas en local quels jeux non installés sont prêtés par la famille. Les jeux d'une collection Steam au choix (par défaut « Mes jeux ») sont considérés comme « à moi », le reste comme familial. Les jeux installés d'un autre compte sont reconnus par `LastOwner`.
 - **Epic** : manifestes et cache du catalogue du lanceur Epic (`%ProgramData%\Epic\EpicGamesLauncher\Data`). La liste « à installer » vient de ce cache : elle peut contenir des jeux qu'on ne possède pas. Epic ne garde pas le temps de jeu sur le PC.

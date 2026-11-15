@@ -17,7 +17,11 @@ use std::{
 /// Vrai quand la bibliothèque Steam n'a pas pu être lue (format du cache changé) : seuls les jeux installés s'affichent.
 static LIBRARY_UNREADABLE: AtomicBool = AtomicBool::new(false);
 
-const ACCENTS: [Color32; 2] = [Color32::from_rgb(0x8b, 0x5c, 0xf6), Color32::from_rgb(0xf4, 0x3f, 0x5e)]; // violet, rouge
+// Identité « Vedette » (2026-11-15) : fond graphite, jaquettes en avant, plus de violet.
+const ACCENTS: [Color32; 2] = [Color32::from_rgb(0x8b, 0x5c, 0xf6), Color32::from_rgb(0xf4, 0x3f, 0x5e)]; // violet, rouge : les deux accents choisis par Pierre (2026-11-09)
+const FOND: Color32 = Color32::from_rgb(0x0f, 0x10, 0x12);
+const SURFACE: Color32 = Color32::from_rgb(0x19, 0x1b, 0x1f);
+const DOUX: Color32 = Color32::from_rgb(0xb4, 0xb7, 0xbe);
 const TEX_W: u32 = 200;
 const TEX_H: u32 = 300;
 const NO_WINDOW: u32 = 0x0800_0000;
@@ -55,7 +59,7 @@ enum Act {
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
-/// 95 -> « 1,6 h » ; 40 -> « 40 min » ; 1537 -> « 26 h »
+/// 90 -> « 1,5 h » ; 40 -> « 40 min » ; 1537 -> « 26 h »
 fn fmt_time(min: u32) -> String {
     match min {
         0..=59 => format!("{min} min"),
@@ -63,8 +67,39 @@ fn fmt_time(min: u32) -> String {
         _ => format!("{} h", (min + 30) / 60),
     }
 }
+/// Décalage de l'heure locale par rapport à UTC, en secondes (demandé à Windows).
+fn local_offset() -> i64 {
+    #[repr(C)]
+    struct Tzi {
+        bias: i32,
+        _std_name: [u16; 32],
+        _std_date: [u16; 8],
+        std_bias: i32,
+        _dl_name: [u16; 32],
+        _dl_date: [u16; 8],
+        dl_bias: i32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetTimeZoneInformation(tzi: *mut Tzi) -> u32;
+    }
+    let mut t = std::mem::MaybeUninit::<Tzi>::zeroed();
+    // SAFETY : la structure a la disposition de TIME_ZONE_INFORMATION (172 octets) ; Windows la remplit, et tout-à-zéro est valide.
+    let (r, t) = unsafe { (GetTimeZoneInformation(t.as_mut_ptr()), t.assume_init()) };
+    let saison = match r {
+        1 => t.std_bias,
+        2 => t.dl_bias,
+        _ => 0,
+    };
+    -60 * (t.bias + saison) as i64
+}
+/// Nombre de minuits (heure locale) passés entre `t` et `now` : un jeu lancé hier à 23 h est « hier », pas « aujourd'hui ».
+fn days_between(now: u64, t: u64, offset: i64) -> u64 {
+    let day = |x: u64| (x as i64 + offset).div_euclid(86_400);
+    (day(now) - day(t)).max(0) as u64
+}
 fn fmt_ago(t: u64) -> String {
-    match now().saturating_sub(t) / 86_400 {
+    match days_between(now(), t, local_offset()) {
         0 => "aujourd'hui".into(),
         1 => "hier".into(),
         d @ 2..=59 => format!("il y a {d} jours"),
@@ -78,6 +113,7 @@ fn fmt_ago(t: u64) -> String {
 enum Src {
     File(PathBuf),
     Dir(PathBuf), // dossier du jeu : exploré plus tard, dans le thread des pochettes
+    Cache(PathBuf, String, &'static str), // cache d'images de Steam : dossier de Steam, appid, nom du fichier (cherché plus tard aussi)
     Url(String, String), // url, nom du fichier en cache
 }
 
@@ -142,10 +178,14 @@ fn state_path() -> PathBuf {
 fn load_state() -> State {
     fs::read_to_string(state_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
+/// Écrit à côté puis renomme : une coupure pendant l'écriture ne laisse jamais un fichier à moitié écrit (favoris perdus).
 fn save_state(s: &State) {
     let p = state_path();
     let _ = fs::create_dir_all(p.parent().unwrap());
-    let _ = fs::write(p, serde_json::to_string(s).unwrap_or_default());
+    let tmp = p.with_extension("json.tmp");
+    if fs::write(&tmp, serde_json::to_string(s).unwrap_or_default()).is_ok() {
+        let _ = fs::rename(&tmp, &p);
+    }
 }
 
 // ---------- lecture du format binaire Valve (appinfo.vdf / packageinfo.vdf) ----------
@@ -284,8 +324,34 @@ fn owned_inner(a: &[u8], q: &[u8], extra: &HashSet<u32>) -> Option<Vec<(u32, Str
 // ---------- scan Steam ----------
 
 /// Toutes les chaînes entre guillemets d'une ligne VDF : `"k"  "v"` -> [k, v]
+/// Les échappements `\\` et `\"` sont compris (un pseudo ou un nom de jeu peut contenir un guillemet).
 fn quoted(line: &str) -> Vec<String> {
-    line.split('"').enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, s)| s.replace("\\\\", "\\")).collect()
+    let (mut out, mut cur, mut inside, mut esc) = (vec![], String::new(), false, false);
+    for c in line.chars() {
+        if !inside {
+            inside = c == '"';
+        } else if esc {
+            cur.push(match c {
+                'n' => '\n',
+                't' => '\t',
+                c => c,
+            });
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            inside = false;
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out
+}
+
+/// Chemin Windows écrit avec des antislashs (le registre donne `c:/program files/steam` : l'Explorateur n'en veut pas).
+fn backslashes(p: &Path) -> PathBuf {
+    PathBuf::from(p.to_string_lossy().replace('/', "\\"))
 }
 
 fn steam_root() -> Option<PathBuf> {
@@ -346,14 +412,16 @@ fn folder_image(dir: &Path) -> Option<PathBuf> {
 
 fn steam_covers(root: &Path, id: &str, dir: Option<&Path>) -> Vec<Src> {
     let cdn = |f: &str| format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{id}/{f}");
-    let mut v = vec![];
-    v.extend(cache_file(root, id, "library_600x900.jpg").map(Src::File));
+    // le cache de Steam n'est fouillé qu'au moment d'afficher la carte (thread des pochettes) :
+    // le faire ici pour toute la bibliothèque coûtait 3 s de fenêtre vide à l'ouverture
+    let cache = |n: &'static str| Src::Cache(root.to_path_buf(), id.to_string(), n);
+    let mut v = vec![cache("library_600x900.jpg")];
     v.push(Src::Url(cdn("library_600x900.jpg"), format!("steam_{id}_p.jpg")));
     v.extend(dir.map(|d| Src::Dir(d.to_path_buf())));
-    v.extend(["header.jpg", "library_header.jpg"].iter().filter_map(|n| cache_file(root, id, n)).map(Src::File));
+    v.extend([cache("header.jpg"), cache("library_header.jpg")]);
     v.push(Src::Url(cdn("header.jpg"), format!("steam_{id}_h.jpg")));
     // jeux récents sans pochette ni bannière : la grande image « hero », recadrée au centre
-    v.extend(cache_file(root, id, "library_hero.jpg").map(Src::File));
+    v.push(cache("library_hero.jpg"));
     v.push(Src::Url(cdn("library_hero.jpg"), format!("steam_{id}_hero.jpg")));
     v
 }
@@ -488,10 +556,17 @@ fn fetch_owned(sid: &str) -> Option<HashSet<u32>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+/// « Mes jeux » d'après le réglage : la collection choisie ; si elle n'existe pas, la liste du profil public gardée en cache.
+/// Réglage « Aucune » : pas de séparation du tout.
+fn owned_for(setting: &str) -> Option<HashSet<u32>> {
+    coll_name(setting)?;
+    collection_owned(setting).or_else(load_owned)
+}
+
 fn spawn_owned(ctx: egui::Context, coll: &str) -> mpsc::Receiver<HashSet<u32>> {
     let (tx, rx) = mpsc::channel();
-    if collection_owned(coll).is_some() {
-        return rx; // la collection locale suffit : aucun accès réseau
+    if coll_name(coll).is_none() || collection_owned(coll).is_some() {
+        return rx; // « Aucune », ou la collection locale suffit : aucun accès réseau
     }
     std::thread::spawn(move || {
         let Some(sid) = steam_root().and_then(|r| steam_id(&r)) else { return };
@@ -518,15 +593,19 @@ fn scan_steam(coll: &str) -> Vec<Game> {
     let Some(root) = steam_root() else { return vec![] };
     let me = steam_id(&root).unwrap_or_default();
     let played = steam_playtime(&root);
-    let mut libs = vec![root.clone()];
+    let mut libs = vec![];
     if let Ok(t) = fs::read_to_string(root.join("steamapps/libraryfolders.vdf")) {
         for l in t.lines() {
             let q = quoted(l);
             if q.len() == 2 && q[0] == "path" {
-                libs.push(PathBuf::from(&q[1]));
+                libs.push(backslashes(Path::new(&q[1])));
             }
         }
     }
+    // le dossier de Steam est aussi dans cette liste (écrit autrement) : sans ce tri il était lu deux fois
+    libs.push(backslashes(&root));
+    let mut seen = HashSet::new();
+    libs.retain(|l| seen.insert(l.to_string_lossy().trim_end_matches('\\').to_lowercase()));
     let mut out: HashMap<String, Game> = HashMap::new();
     // 1) jeux installés (manifests)
     for lib in libs {
@@ -634,7 +713,7 @@ fn epic_catalog() -> HashMap<String, CatItem> {
         let imgs = e["keyImages"].as_array();
         let img = |t: &str| imgs.and_then(|a| a.iter().find(|k| k["type"] == t)).map(|k| s(&k["url"]));
         let item = CatItem {
-            title: s(&e["title"]),
+            title: epic_title(&s(&e["title"])),
             ns: s(&e["namespace"]),
             app: s(&e["releaseInfo"][0]["appId"]),
             image: img("DieselGameBoxTall").or_else(|| img("DieselGameBox")),
@@ -642,6 +721,27 @@ fn epic_catalog() -> HashMap<String, CatItem> {
         if is_game && !item.app.is_empty() && !item.title.contains("Public Testing") {
             out.insert(s(&e["id"]), item);
         }
+    }
+    out
+}
+
+/// Le cache d'Epic écrit « ? » à la place des caractères spéciaux (™, ®, espace insécable, accents).
+/// On retire ceux qu'on reconnaît : « Apex?Legends? » -> « Apex Legends ». Un accent perdu le reste (« ann?e »).
+fn epic_title(t: &str) -> String {
+    let c: Vec<char> = t.chars().collect();
+    let mut out = String::new();
+    for (i, &ch) in c.iter().enumerate() {
+        if ch == '?' && i > 0 && c[i - 1].is_alphanumeric() {
+            match c.get(i + 1) {
+                None | Some(' ' | ':' | ',') => continue, // ™ ou ® en fin de mot
+                Some(n) if n.is_uppercase() => {
+                    out.push(' '); // espace insécable entre deux mots
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(ch);
     }
     out
 }
@@ -665,8 +765,9 @@ fn scan_epic() -> Vec<Game> {
         if !is_game || name.is_empty() || app.is_empty() {
             continue;
         }
+        let dir = Some(backslashes(Path::new(&s("InstallLocation")))).filter(|d| !d.as_os_str().is_empty());
         let mut covers: Vec<Src> = cat.get(&item).and_then(|c| c.image.clone()).map(|u| Src::Url(u, format!("epic_{app}.jpg"))).into_iter().collect();
-        covers.push(Src::Dir(PathBuf::from(s("InstallLocation"))));
+        covers.extend(dir.clone().map(Src::Dir));
         seen.insert(app.clone());
         out.push(Game {
             id: format!("epic:{app}"),
@@ -676,7 +777,7 @@ fn scan_epic() -> Vec<Game> {
             store: Store::Epic,
             installed: true,
             covers,
-            dir: Some(PathBuf::from(s("InstallLocation"))),
+            dir,
             size: v["InstallSize"].as_u64().unwrap_or(0),
             ..Default::default()
         });
@@ -709,7 +810,7 @@ fn setup_lines() -> Vec<(bool, String)> {
     match steam_root() {
         Some(r) => {
             let (id, name) = steam_user(&r).unwrap_or_default();
-            v.push((true, format!("Steam trouvé : {}", r.display())));
+            v.push((true, format!("Steam trouvé : {}", backslashes(&r).display())));
             v.push((!id.is_empty(), if id.is_empty() { "Aucun compte Steam connecté (ouvre Steam et connecte-toi)".to_string() } else { format!("Compte Steam : {}", if name.is_empty() { &id } else { &name }) }));
             if LIBRARY_UNREADABLE.load(Relaxed) {
                 v.push((false, "Bibliothèque Steam illisible : seuls les jeux installés sont listés".to_string()));
@@ -740,7 +841,8 @@ fn scan_other(custom: &[(String, String)]) -> Vec<Game> {
     let mut out = vec![];
     // Roblox : un dossier par version, on prend la plus récente
     let roblox = fs::read_dir(local.join("Roblox/Versions")).into_iter().flatten().flatten().map(|e| e.path().join("RobloxPlayerBeta.exe")).filter(|p| p.exists());
-    if let Some(exe) = roblox.max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok()) {
+    // antislashs partout : avec un « / » dans le chemin, l'Explorateur ouvrait Documents au lieu de lancer Roblox
+    if let Some(exe) = roblox.max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok()).map(|p| backslashes(&p)) {
         out.push(other("other:roblox".into(), "Roblox", exe.to_string_lossy().into_owned(), exe.parent().map(Path::to_path_buf)));
     }
     if local.join("Packages").join(MINECRAFT).exists() {
@@ -810,6 +912,7 @@ fn resolve(src: &Src, cache: &Path) -> Option<image::DynamicImage> {
     match src {
         Src::File(p) => open_image(p),
         Src::Dir(d) => open_image(&folder_image(d)?),
+        Src::Cache(root, id, name) => open_image(&cache_file(root, id, name)?),
         Src::Url(u, name) => {
             let f = cache.join(name);
             if !f.exists() && !fetch(u, &f) {
@@ -840,7 +943,7 @@ fn fit(img: image::DynamicImage, crop: bool) -> image::RgbaImage {
 type Job = (String, Vec<Src>);
 /// Pochettes à la demande : une carte qui devient visible dépose sa demande, 4 threads se partagent la file
 /// (le téléchargement est le point lent). Rien n'est chargé pour les jeux qu'on ne regarde jamais.
-fn spawn_loader(ctx: egui::Context) -> (mpsc::Sender<Job>, mpsc::Receiver<(String, ColorImage)>) {
+fn spawn_loader(ctx: egui::Context) -> (mpsc::Sender<Job>, mpsc::Receiver<(String, Option<ColorImage>)>) {
     let cache = app_dir("LOCALAPPDATA").join("covers");
     let _ = fs::create_dir_all(&cache);
     let (job_tx, job_rx) = mpsc::channel::<Job>();
@@ -851,9 +954,9 @@ fn spawn_loader(ctx: egui::Context) -> (mpsc::Sender<Job>, mpsc::Receiver<(Strin
         std::thread::spawn(move || loop {
             let job = job_rx.lock().unwrap().recv();
             let Ok((id, covers)) = job else { return };
-            let Some((img, crop)) = covers.iter().find_map(|s| resolve(s, &cache).map(|i| (i, matches!(s, Src::Url(_, n) if n.contains("hero")) || matches!(s, Src::File(p) if p.to_string_lossy().contains("hero"))))) else { continue };
-            let t = fit(img, crop);
-            let ci = ColorImage::from_rgba_unmultiplied([TEX_W as usize, TEX_H as usize], t.as_raw());
+            let found = covers.iter().find_map(|s| resolve(s, &cache).map(|i| (i, matches!(s, Src::Url(_, n) if n.contains("hero")) || matches!(s, Src::Cache(_, _, n) if n.contains("hero")))));
+            // aucune image nulle part : on le dit aussi, pour ne pas retenter les téléchargements à chaque rescan
+            let ci = found.map(|(img, crop)| ColorImage::from_rgba_unmultiplied([TEX_W as usize, TEX_H as usize], fit(img, crop).as_raw()));
             if tx.send((id, ci)).is_err() {
                 return;
             }
@@ -870,7 +973,10 @@ struct App {
     tex: HashMap<String, TextureHandle>,
     requested: HashSet<String>, // pochettes déjà demandées au chargeur
     jobs: mpsc::Sender<Job>,
-    rx: mpsc::Receiver<(String, ColorImage)>,
+    rx: mpsc::Receiver<(String, Option<ColorImage>)>,
+    no_cover: HashSet<String>,        // jeux sans aucune pochette trouvée : pas redemandés avant un F5
+    popup_at_press: bool,             // un menu était ouvert quand le bouton de la souris a été enfoncé
+    last_play: Option<(String, f64)>, // dernier jeu lancé et à quelle heure (contre le double-clic)
     owned: Option<HashSet<u32>>,
     owned_rx: mpsc::Receiver<HashSet<u32>>,
     scan_rx: Option<mpsc::Receiver<(Vec<Game>, Option<HashSet<u32>>)>>, // rescan en cours (arrière-plan)
@@ -893,9 +999,9 @@ struct App {
 
 fn apply_theme(ctx: &egui::Context, accent: Color32) {
     let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(0x0e, 0x10, 0x14);
-    v.window_fill = Color32::from_rgb(0x16, 0x19, 0x1f);
-    v.extreme_bg_color = Color32::from_rgb(0x16, 0x19, 0x1f);
+    v.panel_fill = FOND;
+    v.window_fill = SURFACE;
+    v.extreme_bg_color = SURFACE;
     v.selection.bg_fill = accent.gamma_multiply(0.45);
     v.widgets.hovered.bg_stroke.color = accent;
     ctx.set_visuals(v);
@@ -946,19 +1052,29 @@ fn draw_download(p: &egui::Painter, c: egui::Pos2, col: Color32) {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Police système Segoe UI si présente (aucun poids ajouté au binaire)
-        if let Ok(bytes) = fs::read(r"C:\Windows\Fonts\segoeui.ttf") {
+        // Schibsted Grotesk, la police du portfolio (licence OFL, assets/fonts) : le rappel commun à tous les projets.
+        {
             let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert("segoe".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "segoe".into());
+            let mut ajouter = |nom: &str, octets: &'static [u8]| {
+                fonts.font_data.insert(nom.into(), std::sync::Arc::new(egui::FontData::from_static(octets)));
+            };
+            ajouter("schibsted", include_bytes!("../assets/fonts/SchibstedGrotesk-Regular.ttf"));
+            ajouter("schibsted-gras", include_bytes!("../assets/fonts/SchibstedGrotesk-Bold.ttf"));
+            ajouter("schibsted-titre", include_bytes!("../assets/fonts/SchibstedGrotesk-ExtraBold.ttf"));
+            let repli = fonts.families[&egui::FontFamily::Proportional].clone();
+            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "schibsted".into());
+            fonts.families.insert(egui::FontFamily::Name("gras".into()), std::iter::once("schibsted-gras".to_string()).chain(repli.clone()).collect());
+            fonts.families.insert(egui::FontFamily::Name("titre".into()), std::iter::once("schibsted-titre".to_string()).chain(repli).collect());
             cc.egui_ctx.set_fonts(fonts);
         }
         let mut st = load_state();
         st.scope = st.scope.min(5);
         st.sort = st.sort.min(2);
         st.on_launch = st.on_launch.min(2);
-        apply_theme(&cc.egui_ctx, ACCENTS[st.accent.min(ACCENTS.len() - 1)]);
-        let owned = collection_owned(&st.collection).or_else(load_owned);
+        st.accent = st.accent.min(ACCENTS.len() - 1);
+        st.card_w = if st.card_w.is_finite() { st.card_w.clamp(120.0, 260.0) } else { 170.0 };
+        apply_theme(&cc.egui_ctx, ACCENTS[st.accent]);
+        let owned = owned_for(&st.collection);
         let games = scan_all(&owned, &st.custom, &st.collection);
         let (jobs, rx) = spawn_loader(cc.egui_ctx.clone());
         let owned_rx = spawn_owned(cc.egui_ctx.clone(), &st.collection);
@@ -974,6 +1090,9 @@ impl App {
             requested: HashSet::new(),
             jobs,
             rx,
+            no_cover: HashSet::new(),
+            popup_at_press: false,
+            last_play: None,
             owned,
             owned_rx,
             scan_rx: None,
@@ -1013,7 +1132,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (coll, custom, ctx) = (self.st.collection.clone(), self.st.custom.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let owned = collection_owned(&coll).or_else(load_owned); // load_owned : liste du profil public, gardée en cache
+            let owned = owned_for(&coll);
             let _ = tx.send((scan_all(&owned, &custom, &coll), owned));
             ctx.request_repaint();
         });
@@ -1030,6 +1149,12 @@ impl App {
         let steam_id = g.id.trim_start_matches("steam:");
         match a {
             Act::Play => {
+                // double-clic (réflexe du Bureau) : le jeu ne part qu'une fois
+                let t = ctx.input(|i| i.time);
+                if self.last_play.as_ref().is_some_and(|(id, at)| *id == g.id && t - at < 3.0) {
+                    return;
+                }
+                self.last_play = Some((g.id.clone(), t));
                 self.toast(ctx, format!("{} {}…", if g.installed { "Lancement de" } else { "Installation demandée :" }, g.name));
                 open_url(if g.installed { &g.launch_url } else { &g.install_url });
                 if g.installed {
@@ -1053,8 +1178,9 @@ impl App {
                 }
             }
             Act::Folder => {
-                if let Some(d) = &g.dir {
-                    let _ = Command::new("explorer.exe").arg(d).spawn();
+                match g.dir.as_deref().map(backslashes).filter(|d| d.is_dir()) {
+                    Some(d) => drop(Command::new("explorer.exe").arg(d).spawn()),
+                    None => self.toast(ctx, format!("Dossier de {} introuvable", g.name)),
                 }
             }
             Act::StorePage => match g.store {
@@ -1070,6 +1196,7 @@ impl App {
                 let _ = fs::remove_file(custom_cover(&g.id));
                 self.tex.remove(&g.id);
                 self.requested.remove(&g.id);
+                self.no_cover.remove(&g.id);
             }
         }
         save_state(&self.st);
@@ -1086,6 +1213,10 @@ impl App {
             return; // hors de l'écran : rien à dessiner, rien à charger
         }
         let fav = self.st.favs.contains(&g.id);
+        // l'étoile est posée par-dessus la carte : quand la souris est dessus, c'est elle qui est « survolée », plus la carte
+        let star_rect = egui::Rect::from_center_size(rect.right_top() + Vec2::new(-18.0, 18.0), Vec2::splat(26.0));
+        let star = ui.interact(star_rect, egui::Id::unique(("star", &g.id)), Sense::click());
+        let over = resp.hovered() || star.hovered();
         let p = ui.painter_at(rect);
         let r = 10.0;
         match self.tex.get(&g.id) {
@@ -1106,8 +1237,8 @@ impl App {
             }
         }
         if !g.installed {
-            p.rect_filled(rect, r, Color32::from_black_alpha(if resp.hovered() { 90 } else { 120 }));
-            if resp.hovered() {
+            p.rect_filled(rect, r, Color32::from_black_alpha(if over { 90 } else { 120 }));
+            if over {
                 draw_download(&p, rect.center() - Vec2::new(0.0, 20.0), accent);
             }
         }
@@ -1119,31 +1250,29 @@ impl App {
         p.rect_filled(band, egui::CornerRadius { nw: 0, ne: 0, sw: r as u8, se: r as u8 }, Color32::from_black_alpha(190));
         p.galley(band.min + Vec2::new(8.0, 7.0), galley, Color32::WHITE);
         let mut tag = match g.store {
-            Store::Steam => "STEAM",
-            Store::Epic => "EPIC",
-            Store::Other => "AUTRE",
+            Store::Steam => "Steam",
+            Store::Epic => "Epic",
+            Store::Other => "Autre",
         }
         .to_string();
         if g.family {
-            tag += " · FAMILLE";
+            tag += ", famille";
         }
         if g.update {
-            tag += " · MISE À JOUR";
+            tag += ", mise à jour";
         }
         if g.playtime > 0 {
-            tag += &format!(" · {}", fmt_time(g.playtime));
+            tag += &format!(", {}", fmt_time(g.playtime));
         }
-        p.text(egui::pos2(rect.min.x + 8.0, rect.max.y - 10.0), egui::Align2::LEFT_CENTER, tag, FontId::proportional(10.0), accent);
+        p.text(egui::pos2(rect.min.x + 8.0, rect.max.y - 11.0), egui::Align2::LEFT_CENTER, tag, FontId::proportional(11.5), DOUX);
         // étoile favori
-        let star_rect = egui::Rect::from_center_size(rect.right_top() + Vec2::new(-18.0, 18.0), Vec2::splat(26.0));
-        let star = ui.interact(star_rect, ui.next_auto_id().with(("star", &g.id)), Sense::click());
-        if fav || resp.hovered() {
-            p.circle_filled(star_rect.center(), 13.0, Color32::from_black_alpha(150));
-            draw_star(&p, star_rect.center(), 8.0, fav, if fav { accent } else { Color32::from_white_alpha(190) });
+        if fav || over {
+            p.circle_filled(star_rect.center(), 13.0, Color32::from_black_alpha(if star.hovered() { 220 } else { 150 }));
+            draw_star(&p, star_rect.center(), 8.0, fav, if fav { accent } else { Color32::from_white_alpha(if star.hovered() { 255 } else { 190 }) });
         }
         let stroke = if selected {
             egui::Stroke::new(3.0, Color32::WHITE)
-        } else if resp.hovered() {
+        } else if over {
             egui::Stroke::new(2.0, accent)
         } else {
             egui::Stroke::new(1.0, Color32::from_white_alpha(14))
@@ -1194,7 +1323,9 @@ impl App {
                 item(ui, "Désinstaller…", Act::Uninstall);
             }
         });
-        if star.clicked() {
+        // un clic qui sert à refermer un menu (clic droit, tri…) ne doit pas lancer le jeu qui se trouve dessous
+        if self.popup_at_press {
+        } else if star.clicked() {
             act = Some(Act::Fav);
         } else if resp.clicked() {
             act = Some(Act::Play);
@@ -1203,6 +1334,53 @@ impl App {
             let ctx = ui.ctx().clone();
             self.act(&ctx, i, a);
         }
+    }
+
+    /// Bandeau « Vedette » : la jaquette en grand, le nom, le temps de jeu et un bouton Jouer. Renvoie vrai si on clique Jouer.
+    fn vedette(&mut self, ui: &mut egui::Ui, i: usize) -> bool {
+        let g = self.games[i].clone();
+        if !self.tex.contains_key(&g.id) && self.requested.insert(g.id.clone()) {
+            let mut srcs = vec![Src::File(custom_cover(&g.id))];
+            srcs.extend(g.covers.iter().cloned());
+            let _ = self.jobs.send((g.id.clone(), srcs));
+        }
+        let mut jouer = false;
+        egui::Frame::new().fill(SURFACE).corner_radius(14.0).inner_margin(20.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let taille = Vec2::new(170.0, 255.0);
+                match self.tex.get(&g.id) {
+                    Some(t) => {
+                        ui.add(egui::Image::new(t).fit_to_exact_size(taille).corner_radius(10.0));
+                    }
+                    None => {
+                        let (r, _) = ui.allocate_exact_size(taille, Sense::hover());
+                        ui.painter().rect_filled(r, 10.0, Color32::from_rgb(0x2a, 0x2d, 0x33));
+                    }
+                }
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    ui.add_space(40.0);
+                    let last = g.last_played.max(*self.st.last.get(&g.id).unwrap_or(&0));
+                    ui.label(RichText::new(if last > 0 { "Dernier lancé" } else { "Le plus joué" }).size(15.0).color(DOUX));
+                    ui.label(RichText::new(&g.name).font(FontId::new(46.0, egui::FontFamily::Name("titre".into()))).color(Color32::WHITE));
+                    // seul Steam garde un temps de jeu : pour les autres on n'écrit pas « jamais joué », on n'en sait rien
+                    let info = match (g.playtime > 0, last > 0) {
+                        (true, true) => format!("{} de jeu, lancé {}", fmt_time(g.playtime), fmt_ago(last)),
+                        (true, false) => format!("{} de jeu", fmt_time(g.playtime)),
+                        (false, _) => format!("Lancé {}", fmt_ago(last)),
+                    };
+                    ui.label(RichText::new(info).size(16.0).color(DOUX));
+                    ui.add_space(16.0);
+                    let bouton = egui::Button::new(RichText::new("Jouer").font(FontId::new(18.0, egui::FontFamily::Name("gras".into()))).color(FOND))
+                        .fill(Color32::WHITE)
+                        .corner_radius(8.0);
+                    // add_sized centre le mot dans le bouton (avec min_size il restait collé à gauche)
+                    jouer = ui.add_sized(Vec2::new(130.0, 46.0), bouton).clicked() && !self.popup_at_press;
+                });
+            });
+        });
+        jouer
     }
 
     /// Onglet Profil : chiffres tirés des données locales de Steam, puis les réglages.
@@ -1228,7 +1406,7 @@ impl App {
             (format!("{:.1}", total as f32 / 1440.0).replace('.', ","), "jours complets, nuits comprises".to_string()),
             ((self.games.len() - fam).to_string(), "jeux à moi".to_string()),
             (fam.to_string(), "jeux prêtés par la famille".to_string()),
-            (installed.to_string(), format!("installés · {:.0} Go", disk as f64 / 1e9)),
+            (installed.to_string(), format!("installés, {:.0} Go", disk as f64 / 1e9)),
             (never.to_string(), format!("jamais lancés sur {steam_mine} jeux Steam")),
             (self.st.favs.len().to_string(), "favoris".to_string()),
         ];
@@ -1247,14 +1425,14 @@ impl App {
                 ui.vertical(|ui| {
                     ui.add_space(10.0);
                     ui.label(RichText::new(if self.persona.is_empty() { "Mon profil" } else { &self.persona }).size(26.0).strong());
-                    ui.label(RichText::new(format!("{} jeux dans le lanceur · {played} déjà lancés sur Steam", self.games.len())).color(gray));
+                    ui.label(RichText::new(format!("{} jeux dans le lanceur, {played} déjà lancés sur Steam", self.games.len())).color(gray));
                 });
             });
             ui.add_space(14.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::splat(10.0);
                 for (big, small) in &tiles {
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(200.0, 86.0), Sense::hover());
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(224.0, 86.0), Sense::hover()); // 224 : la légende la plus longue tient dans la tuile
                     let p = ui.painter();
                     p.rect_filled(r, 10.0, Color32::from_rgb(0x16, 0x19, 0x1f));
                     p.text(r.min + Vec2::new(14.0, 10.0), egui::Align2::LEFT_TOP, big, FontId::proportional(28.0), Color32::WHITE);
@@ -1267,7 +1445,12 @@ impl App {
                 for (i, (name, min)) in top.iter().enumerate() {
                     let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width().min(760.0), 26.0), Sense::hover());
                     let p = ui.painter();
-                    p.text(r.left_center(), egui::Align2::LEFT_CENTER, format!("{}. {name}", i + 1), FontId::proportional(14.0), Color32::WHITE);
+                    // nom coupé par « … » à la largeur de sa colonne : un long titre passait sur la barre
+                    let mut job = egui::text::LayoutJob::simple(format!("{}. {name}", i + 1), FontId::proportional(14.0), Color32::WHITE, 236.0);
+                    job.wrap.max_rows = 1;
+                    job.wrap.break_anywhere = true;
+                    let galley = p.layout_job(job);
+                    p.galley(egui::pos2(r.min.x, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
                     let bar = egui::Rect::from_min_max(egui::pos2(r.min.x + 250.0, r.min.y + 7.0), egui::pos2(r.max.x - 80.0, r.max.y - 7.0));
                     p.rect_filled(bar, 6.0, Color32::from_white_alpha(10));
                     let mut fill = bar;
@@ -1283,7 +1466,7 @@ impl App {
                 for (name, t) in &recent {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(name).size(14.0));
-                        ui.label(RichText::new(format!("· {}", fmt_ago(*t))).color(gray));
+                        ui.label(RichText::new(fmt_ago(*t)).color(gray));
                     });
                 }
             }
@@ -1378,11 +1561,22 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         while let Ok((id, ci)) = self.rx.try_recv() {
-            self.tex.insert(id.clone(), ctx.load_texture(id, ci, egui::TextureOptions::LINEAR));
+            match ci {
+                Some(ci) => drop(self.tex.insert(id.clone(), ctx.load_texture(id, ci, egui::TextureOptions::LINEAR))),
+                None => drop(self.no_cover.insert(id)),
+            }
         }
         if let Ok(set) = self.owned_rx.try_recv() {
-            self.owned = Some(set);
-            apply_family(&mut self.games, &self.owned);
+            // la liste du profil public arrive après coup : on l'ignore si entre-temps le réglage est passé sur « Aucune »
+            if coll_name(&self.st.collection).is_some() {
+                self.owned = Some(set);
+                apply_family(&mut self.games, &self.owned);
+            }
+        }
+        // un menu (clic droit, tri, collection) était-il ouvert quand le bouton de la souris a été enfoncé ?
+        let popup = egui::Popup::is_any_open(ctx);
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.popup_at_press = popup;
         }
         // résultat d'un rescan fait en arrière-plan : on garde les pochettes déjà chargées (pas de clignotement)
         let scanned = self.scan_rx.as_ref().and_then(|r| r.try_recv().ok());
@@ -1392,11 +1586,13 @@ impl eframe::App for App {
             self.refresh_diag();
             self.scan_rx = None;
             self.tex.retain(|id, _| self.games.iter().any(|g| &g.id == id));
-            self.requested.retain(|id| self.tex.contains_key(id));
+            // les jeux sans pochette ne sont pas redemandés (3 téléchargements ratés chacun) : seulement après un F5
+            self.requested.retain(|id| self.tex.contains_key(id) || self.no_cover.contains(id));
         }
         let accent = ACCENTS[self.st.accent.min(ACCENTS.len() - 1)];
         let (time, focused) = ctx.input(|i| (i.time, i.focused));
         let mut rescan = ctx.input(|i| i.key_pressed(egui::Key::F5));
+        let mut manual = rescan; // rescan demandé (F5, bouton) et non automatique : on retente aussi les pochettes manquantes
         // retour sur la fenêtre (après une installation, un jeu…) : on rescanne tout seul, au plus toutes les 10 s
         rescan |= focused && !self.was_focused && time - self.last_scan > 10.0;
         self.was_focused = focused;
@@ -1408,6 +1604,9 @@ impl eframe::App for App {
                     if fs::copy(&path, custom_cover(&id)).is_ok() {
                         self.tex.remove(&id);
                         self.requested.remove(&id);
+                        self.no_cover.remove(&id);
+                    } else {
+                        self.toast(ctx, "Impossible de copier cette image".to_string());
                     }
                 }
                 Pick::AddGame => {
@@ -1431,16 +1630,19 @@ impl eframe::App for App {
         dirty |= closing;
         let (mut search_focused, mut search_enter) = (false, false);
 
-        egui::Panel::top("top").frame(egui::Frame::new().fill(Color32::from_rgb(0x12, 0x14, 0x19)).inner_margin(12.0)).show(root, |ui| {
+        egui::Panel::top("top").frame(egui::Frame::new().fill(FOND).inner_margin(egui::Margin::symmetric(20, 14))).show(root, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Lanceur").size(21.0).strong().color(accent));
+                ui.label(RichText::new("Lanceur").font(FontId::new(24.0, egui::FontFamily::Name("titre".into()))).color(Color32::WHITE));
                 ui.add_space(10.0);
-                let search = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher… (tape directement)").desired_width(200.0));
+                let search = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(200.0)).on_hover_text("Tu peux aussi taper directement, sans cliquer ici");
                 if std::mem::take(&mut self.focus_search) {
                     search.request_focus();
                 }
                 if search.changed() {
                     self.sel = None;
+                    if self.st.scope == 3 && !self.query.is_empty() {
+                        self.st.scope = 2; // chercher depuis le Profil : on montre les résultats, dans « Tout »
+                    }
                 }
                 search_focused = search.has_focus();
                 search_enter = search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1449,6 +1651,7 @@ impl eframe::App for App {
                     draw_refresh(ui.painter(), r, resp.hovered(), accent);
                     if resp.on_hover_text("Rescanner les bibliothèques (F5)").clicked() {
                         rescan = true;
+                        manual = true;
                     }
                     for i in (0..ACCENTS.len()).rev() {
                         let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
@@ -1479,9 +1682,10 @@ impl eframe::App for App {
                     count[g.group()] += 1;
                     count[2] += 1;
                 }
-                let optional = |i: usize| matches!(i, 1 | 4 | 5); // Famille, Epic, Autres : cachés quand ils n'ont aucun jeu
+                // Steam, Famille, Epic, Autres : cachés quand ils n'ont aucun jeu (PC sans Steam : plus d'onglet « Steam 0 » vide à l'ouverture)
+                let optional = |i: usize| matches!(i, 0 | 1 | 4 | 5);
                 if optional(self.st.scope) && count[self.st.scope] == 0 {
-                    self.st.scope = 0; // onglet vidé (plus aucun jeu) : retour au premier
+                    self.st.scope = 2; // onglet vidé (plus aucun jeu) : on passe sur « Tout »
                 }
                 // ordre d'affichage ≠ numéros : les numéros 0 à 3 sont ceux déjà enregistrés dans state.json
                 for (i, name) in [(0, "Steam"), (1, "Famille Steam"), (4, "Epic"), (5, "Autres"), (2, "Tout"), (3, "Profil")] {
@@ -1515,14 +1719,32 @@ impl eframe::App for App {
             });
         });
 
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(0x0e, 0x10, 0x14)).inner_margin(16.0)).show(root, |ui| {
+        // Clavier, partie commune : Échap efface la recherche, taper du texte part dans la recherche.
+        // Fait ici, avant de filtrer : même quand la recherche ne trouve rien (avant, le clavier était alors sans effet).
+        let typed: String = ctx.input(|i| i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None }).collect());
+        if popup {
+            // un menu est ouvert : Échap le referme, les lettres ne vont nulle part
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.query.clear();
+            self.sel = None;
+        } else if !search_focused && ctx.memory(|m| m.focused().is_none()) && !typed.trim().is_empty() {
+            self.query += &typed;
+            self.focus_search = true;
+            self.sel = None;
+            if self.st.scope == 3 {
+                self.st.scope = 2;
+            }
+            ctx.request_repaint();
+        }
+
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(FOND).inner_margin(egui::Margin::symmetric(20, 16))).show(root, |ui| {
             let full = ui.max_rect();
             if let Some((text, until)) = &self.toast {
                 if ui.input(|i| i.time) < *until {
                     let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("toast")));
                     let galley = p.layout_no_wrap(text.clone(), FontId::proportional(14.0), Color32::WHITE);
                     let r = egui::Rect::from_center_size(egui::pos2(full.center().x, full.max.y - 34.0), galley.size() + Vec2::new(28.0, 16.0));
-                    p.rect_filled(r, 8.0, Color32::from_rgb(0x1c, 0x20, 0x28));
+                    p.rect_filled(r, 8.0, SURFACE);
                     p.rect_stroke(r, 8.0, egui::Stroke::new(1.0, accent), egui::StrokeKind::Inside);
                     p.galley(r.min + Vec2::new(14.0, 8.0), galley, Color32::WHITE);
                     ctx.request_repaint_after(std::time::Duration::from_millis(300));
@@ -1595,13 +1817,23 @@ impl eframe::App for App {
                 for (inst, what) in [(true, "Installés"), (false, "À installer")] {
                     let list: Vec<usize> = idx.iter().copied().filter(|&i| self.games[i].group() == grp && self.games[i].installed == inst).collect();
                     if !list.is_empty() {
-                        blocks.push((if scope == 2 { format!("{who} · {}", what.to_lowercase()) } else { what.to_string() }, list));
+                        blocks.push((if scope == 2 { format!("{who}, {}", what.to_lowercase()) } else { what.to_string() }, list));
                     }
                 }
             }
             let order: Vec<usize> = blocks.iter().flat_map(|b| b.1.iter().copied()).collect();
             let n = order.len();
             self.sel = self.sel.filter(|&s| s < n);
+            // Vedette : le dernier jeu installé lancé (à défaut le plus joué), seulement sur la vue d'ensemble.
+            // Aucun jeu jamais lancé dans cet onglet (Epic au premier jour…) : pas de vedette, plutôt qu'un jeu pris au hasard.
+            let vedette_i = if q.is_empty() && self.filter == Filter::All {
+                idx.iter().copied().filter(|&i| self.games[i].installed && (last(&self.games[i]) > 0 || self.games[i].playtime > 0)).max_by_key(|&i| {
+                    let g = &self.games[i];
+                    (last(g), g.playtime)
+                })
+            } else {
+                None
+            };
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 let gap = 14.0;
                 ui.spacing_mut().item_spacing = Vec2::splat(gap);
@@ -1609,18 +1841,13 @@ impl eframe::App for App {
                 let cols = ((ui.available_width() + gap) / (self.st.card_w + gap)).floor().max(1.0);
                 let w = ((ui.available_width() - (cols - 1.0) * gap) / cols).floor();
 
-                // clavier : flèches + Entrée ; taper du texte part dans la recherche ; Échap efface
+                // clavier, partie grille : flèches + Entrée (Échap et la frappe directe sont traités plus haut)
                 // ponytail: haut/bas avancent d'une ligne « à plat », sans tenir compte des titres de blocs (décalage de colonne possible entre deux blocs)
                 let c = cols as usize;
-                let (typed, esc, enter) = ctx.input(|i| {
-                    let t: String = i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None }).collect();
-                    (t, i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter))
-                });
                 let key = |k| ctx.input(|i| i.key_pressed(k));
                 let mut launch = None;
-                if esc {
-                    self.query.clear();
-                    self.sel = None;
+                if popup {
+                    // un menu est ouvert : les flèches et Entrée sont pour lui
                 } else if search_enter {
                     if !q.is_empty() {
                         launch = Some(order[self.sel.unwrap_or(0)]);
@@ -1631,12 +1858,7 @@ impl eframe::App for App {
                         (self.sel, self.sel_moved) = (Some(0), true);
                     }
                 } else if ctx.memory(|m| m.focused().is_none()) {
-                    if !typed.trim().is_empty() {
-                        self.query += &typed;
-                        self.focus_search = true;
-                        self.sel = None;
-                        ctx.request_repaint();
-                    } else if enter {
+                    if key(egui::Key::Enter) {
                         launch = self.sel.map(|s| order[s]);
                     } else {
                         let s = self.sel;
@@ -1657,9 +1879,16 @@ impl eframe::App for App {
                     }
                 }
 
+                if let Some(i) = vedette_i {
+                    if self.vedette(ui, i) {
+                        launch = Some(i);
+                    }
+                    ui.add_space(10.0);
+                }
+
                 let mut k = 0;
                 for (title, list) in &blocks {
-                    ui.label(RichText::new(format!("{title}  ·  {}", list.len())).size(16.0).strong().color(accent));
+                    ui.label(RichText::new(format!("{title} ({})", list.len())).font(FontId::new(19.0, egui::FontFamily::Name("gras".into()))).color(Color32::WHITE));
                     for row in list.chunks(c) {
                         ui.horizontal(|ui| {
                             for &i in row {
@@ -1681,6 +1910,9 @@ impl eframe::App for App {
             save_state(&self.st);
         }
         if rescan {
+            if manual {
+                self.no_cover.clear();
+            }
             self.last_scan = time;
             self.rescan(ctx);
         }
@@ -1740,6 +1972,35 @@ mod tests {
         assert_eq!(coll_name("-"), None);
         assert_eq!(coll_name("Favoris"), Some("Favoris"));
         assert!(collection_owned("-").is_none());
+        assert!(owned_for("-").is_none(), "« Aucune » ne doit pas retomber sur la liste du profil public");
+    }
+
+    #[test]
+    fn vdf_quotes_and_paths() {
+        assert_eq!(quoted("\t\"path\"\t\t\"E:\\\\04_Apps\\\\Steam\""), vec!["path", "E:\\04_Apps\\Steam"]);
+        assert_eq!(quoted("\t\"PersonaName\"\t\t\"Le \\\"Boss\\\"\""), vec!["PersonaName", "Le \"Boss\""]);
+        assert_eq!(quoted("\t\"730\""), vec!["730"]);
+        assert_eq!(quoted("{"), Vec::<String>::new());
+        assert_eq!(backslashes(Path::new("c:/program files (x86)/steam")), PathBuf::from("c:\\program files (x86)\\steam"));
+    }
+
+    #[test]
+    fn epic_titles() {
+        assert_eq!(epic_title("Apex?Legends?"), "Apex Legends");
+        assert_eq!(epic_title("Rocket League?"), "Rocket League");
+        assert_eq!(epic_title("Dragon?Age?: Inquisition"), "Dragon Age: Inquisition");
+        assert_eq!(epic_title("Fall Guys"), "Fall Guys");
+        assert_eq!(epic_title("l'ann?e"), "l'ann?e", "un accent perdu ne se devine pas");
+    }
+
+    #[test]
+    fn calendar_days() {
+        let minuit = 1_700_006_400; // 2023-11-15 00:00 UTC
+        assert_eq!(days_between(minuit + 9 * 3600, minuit - 3600, 0), 1, "hier à 23 h, vu à 9 h : hier");
+        assert_eq!(days_between(minuit + 9 * 3600, minuit + 3600, 0), 0);
+        assert_eq!(days_between(minuit + 1800, minuit - 1800, 3600), 0, "à UTC+1, 23 h 30 et 0 h 30 UTC sont le même jour");
+        assert_eq!(days_between(minuit, minuit + 5, 0), 0, "horloge en retard : jamais négatif");
+        assert!((-14 * 3600..=14 * 3600).contains(&local_offset()));
     }
 
     #[test]
